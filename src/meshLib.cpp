@@ -1,39 +1,36 @@
 #include "meshLib.h"
 
-// Broadcast MAC
+// FF:FF:FF:FF:FF:FF
 static const uint8_t BROADCAST_ADDR[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 
+// singleton
 MeshLib *MeshLib::_instance = nullptr;
 
-// ========================================
-// Konstruktor
-// ========================================
-MeshLib::MeshLib(ReceiveCallback callback) : _callback(callback) {
-  _instance = this;
-}
+// ====== konstruktor ======
+MeshLib::MeshLib(ReceiveCallback cb) : _callback(cb) { _instance = this; }
 
-// ========================================
-// Inicjalizacja ESP-NOW Mesh
-// ========================================
+// ====== init ======
 void MeshLib::initMesh(const char *name,
                        const char *subscribed[],
                        int topics_count,
                        uint8_t wifi_channel)
 {
-  _name = name;
+  _name            = name;
   _subscribed_topics = subscribed;
-  _topics_count = topics_count;
-  _channel = wifi_channel ? wifi_channel : 1;
+  _topics_count    = topics_count;
+  _channel         = wifi_channel ? wifi_channel : 1;
 
 #if defined(ARDUINO_ARCH_ESP32)
   WiFi.mode(WIFI_STA);
+  esp_wifi_set_ps(WIFI_PS_NONE);                         // pełna moc, bez sleep
+  esp_wifi_set_max_tx_power(78);                         // ~19.5 dBm
+  esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_LR); // long range
   esp_wifi_set_channel(_channel, WIFI_SECOND_CHAN_NONE);
 
   if (esp_now_init() != ESP_OK) {
     MESH_LOG("❌ ESP-NOW init failed (ESP32)\n");
     while (true) delay(1000);
   }
-
   esp_now_register_recv_cb(&_recvThunk);
 
   esp_now_peer_info_t peer{};
@@ -46,6 +43,8 @@ void MeshLib::initMesh(const char *name,
 
 #elif defined(ARDUINO_ARCH_ESP8266)
   WiFi.mode(WIFI_STA);
+  WiFi.setSleepMode(WIFI_NONE_SLEEP);                    // pełna moc, bez sleep
+  WiFi.setOutputPower(20.5f);                            // ~20.5 dBm
   wifi_set_channel(_channel);
 
   if (esp_now_init() != 0) {
@@ -65,9 +64,7 @@ void MeshLib::initMesh(const char *name,
            _name ? _name : "node", _channel, WiFi.macAddress().c_str());
 }
 
-// ========================================
-// Wysyłanie wiadomości
-// ========================================
+// ====== send ======
 bool MeshLib::sendMessage(const standard_mesh_message &message) {
 #if defined(ARDUINO_ARCH_ESP32)
   esp_err_t r = esp_now_send(BROADCAST_ADDR,
@@ -82,9 +79,7 @@ bool MeshLib::sendMessage(const standard_mesh_message &message) {
 #endif
 }
 
-// ========================================
-// Rozgłoszenie discover/get
-// ========================================
+// ====== discover ======
 bool MeshLib::sendDiscover(int ttl) {
   standard_mesh_message msg{};
   msg.ttl = (ttl > 0) ? ttl : 1;
@@ -95,9 +90,7 @@ bool MeshLib::sendDiscover(int ttl) {
   return sendMessage(msg);
 }
 
-// ========================================
-// Callback thunk
-// ========================================
+// ====== thunk RX ======
 #if defined(ARDUINO_ARCH_ESP32)
 void MeshLib::_recvThunk(const uint8_t *mac, const uint8_t *data, int len) {
   if (_instance) _instance->_handleReceive(mac, data, len);
@@ -108,37 +101,53 @@ void MeshLib::_recvThunk(uint8_t *mac, uint8_t *data, uint8_t len) {
 }
 #endif
 
-// ========================================
-// Obsługa odbioru
-// ========================================
+// ====== RX handler ======
 void MeshLib::_handleReceive(const uint8_t *mac, const uint8_t *data, int len) {
   if (len != (int)sizeof(standard_mesh_message)) return;
 
   standard_mesh_message msg{};
   memcpy(&msg, data, sizeof(msg));
 
-  // Pomiń własne ramki
-  if (WiFi.macAddress().equals(String(msg.sender))) return;
+  // --- binarny self-check po MAC z callbacka ---
+  uint8_t my[6];
+#if defined(ARDUINO_ARCH_ESP32)
+  esp_wifi_get_mac(WIFI_IF_STA, my);
+#else
+  wifi_get_macaddr(STATION_IF, my);
+#endif
+  if (memcmp(my, mac, 6) == 0) return; // moja własna ramka → ignoruj
 
-  // Automatyka CMD
+  // --- deduplikacja (FIFO z ostatnich ramek) ---
+  if (_seenAndRemember(msg)) {
+    MESH_LOG("↩️ dup drop %s/%s\n", msg.type, msg.topic);
+    return;
+  }
+
+  // --- automatyka CMD (np. discover) — PRZED filtrem subskrypcji ---
   if (_equals(msg.type, MESH_TYPE_CMD)) {
     _autoHandleCmd(msg);
   }
 
-  // Filtr subskrypcji (0 = wszystkie)
+  // --- filtr subów dla callbacka użytkownika (0=wszystko) ---
   bool subscribed = (_topics_count == 0);
   for (int i = 0; !subscribed && i < _topics_count; ++i) {
     if (_equals(_subscribed_topics[i], msg.topic)) subscribed = true;
   }
-
   if (subscribed && _callback) {
     _callback(msg);
   }
 
-  // Forward TTL
+  // --- flood z TTL i krótkim backoffem (mniej kolizji) ---
   if (msg.ttl > 0) {
     msg.ttl -= 1;
     if (msg.ttl > 0) {
+      // losowy mikro-backoff
+#if defined(ARDUINO_ARCH_ESP32)
+      uint32_t us = 1000 + (esp_random() % 3000); // 1..4 ms
+#else
+      uint32_t us = 1000 + (random() % 3000);     // 1..4 ms
+#endif
+      delayMicroseconds(us);
 #if defined(ARDUINO_ARCH_ESP32)
       esp_now_send(BROADCAST_ADDR, (uint8_t*)&msg, sizeof(msg));
 #else
@@ -148,9 +157,7 @@ void MeshLib::_handleReceive(const uint8_t *mac, const uint8_t *data, int len) {
   }
 }
 
-// ========================================
-// Auto-handling discover
-// ========================================
+// ====== automatyka CMD ======
 void MeshLib::_autoHandleCmd(standard_mesh_message &msg) {
   if (_equals(msg.topic, MESH_TOPIC_DISCOVER_GET)) {
     _sendDiscoverPost();
@@ -169,6 +176,7 @@ void MeshLib::_sendDiscoverPost() {
 #else
   const char *chip = "esp8266";
 #endif
+
   String mac = WiFi.macAddress();
   snprintf(resp.payload, sizeof(resp.payload),
            "name=%s;mac=%s;chip=%s;channel=%u",
@@ -177,9 +185,7 @@ void MeshLib::_sendDiscoverPost() {
   (void)sendMessage(resp);
 }
 
-// ========================================
-// Pomocnicze
-// ========================================
+// ====== helpers ======
 void MeshLib::_fillSender(standard_mesh_message &msg) const {
   String mac = WiFi.macAddress();
   strncpy(msg.sender, mac.c_str(), sizeof(msg.sender)-1);
@@ -188,4 +194,31 @@ void MeshLib::_fillSender(standard_mesh_message &msg) const {
 bool MeshLib::_equals(const char *a, const char *b) {
   if (!a || !b) return false;
   return strcmp(a, b) == 0;
+}
+
+// ====== deduplikacja ======
+uint32_t MeshLib::_hash32(const standard_mesh_message &m) {
+  // prosty FNV-1a po kluczowych polach
+  uint32_t h = 2166136261u;
+  auto mix = [&](const char* s){
+    if (!s) return;
+    for (; *s; ++s) { h ^= (uint8_t)(*s); h *= 16777619u; }
+  };
+  mix(m.sender);
+  mix(m.type);
+  mix(m.topic);
+  mix(m.payload);
+  h ^= (uint32_t)m.ttl; h *= 16777619u;
+  if (h == 0) h = 1;
+  return h;
+}
+
+bool MeshLib::_seenAndRemember(const standard_mesh_message &m) {
+  uint32_t h = _hash32(m);
+  for (int i = 0; i < DEDUP_MAX; ++i) {
+    if (_dedup[i] == h) return true;
+  }
+  _dedup[_dedup_idx] = h;
+  _dedup_idx = (_dedup_idx + 1) % DEDUP_MAX;
+  return false;
 }
