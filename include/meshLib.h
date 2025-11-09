@@ -27,6 +27,16 @@
   #define MESH_LOG(...) do {} while(0)
 #endif
 
+// ===== Deduplikacja: okno czasowe w ms (pakiety identyczne w tym oknie są dropowane) =====
+#ifndef MESH_DEDUP_WINDOW_MS
+  #define MESH_DEDUP_WINDOW_MS 1000  // 1 s
+#endif
+
+// (Opcjonalnie) przepuszczaj zawsze idempotentne toggle (0/1/ON/OFF) niezależnie od dedupe
+#ifndef MESH_DEDUP_BYPASS_TOGGLES
+  #define MESH_DEDUP_BYPASS_TOGGLES 0
+#endif
+
 // ===== Stałe protokołu =====
 #define MESH_TYPE_DATA  "data"
 #define MESH_TYPE_CMD   "cmd"
@@ -52,7 +62,7 @@ public:
   explicit MeshLib(ReceiveCallback cb);
 
   // name: nazwa węzła (do discover/post)
-  // subscribed: lista subów; gdy topics_count==0 => przyjmuj wszystko (callback)
+  // subscribed: lista subów; gdy topics_count==0 => callback dostaje wszystko
   // wifi_channel: 1..14 (zwykle 1/6/11); musi być taki sam u wszystkich
   void initMesh(const char *name,
                 const char *subscribed[],
@@ -72,10 +82,14 @@ private:
   // callback użytkownika
   ReceiveCallback _callback = nullptr;
 
-  // deduplikacja
+  // deduplikacja (hash + timestamp)
   static const int DEDUP_MAX = 24;
-  uint32_t _dedup[DEDUP_MAX] = {0};
-  int      _dedup_idx = 0;
+  struct DedupEntry {
+    uint32_t h;   // hash
+    uint32_t ts;  // millis() zapis
+  };
+  DedupEntry _dedup[DEDUP_MAX] = {};
+  int        _dedup_idx = 0;
 
   // singleton do thunków C
   static MeshLib *_instance;
@@ -98,6 +112,7 @@ private:
 
   // deduplikacja
   static uint32_t _hash32(const standard_mesh_message &m);
+  void _dedupPurgeOld();
   bool _seenAndRemember(const standard_mesh_message &m);
 };
 
