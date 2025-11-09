@@ -1,0 +1,24 @@
+{
+  "name": "MeshLib",
+  "version": "1.0.0",
+  "description": "Prosta biblioteka ESP-NOW mesh dla ESP32/ESP8266 (discover, TTL, broadcast).",
+  "keywords": ["esp-now", "mesh", "esp32", "esp8266", "wireless"],
+  "authors": [
+    { "name": "p4tkry", "url": "https://github.com/p4tkry" }
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/p4tkry/MeshLib.git"
+  },
+  "frameworks": ["arduino"],
+  "platforms": ["espressif32", "espressif8266"],
+  "headers": ["meshLib.h"],
+  "export": {
+    "exclude": [".github", "test", "docs", ".vscode", ".idea"]
+  },
+  "build": {
+    "includeDir": "include",
+    "srcDir": "src"
+  }
+}
