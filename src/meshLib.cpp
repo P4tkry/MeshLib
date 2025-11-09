@@ -1,30 +1,27 @@
 #include "meshLib.h"
 
-// FF:FF:FF:FF:FF:FF
+// Broadcast FF:FF:FF:FF:FF:FF
 static const uint8_t BROADCAST_ADDR[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 
-// singleton
 MeshLib *MeshLib::_instance = nullptr;
 
-// ====== konstruktor ======
 MeshLib::MeshLib(ReceiveCallback cb) : _callback(cb) { _instance = this; }
 
-// ====== init ======
 void MeshLib::initMesh(const char *name,
                        const char *subscribed[],
                        int topics_count,
                        uint8_t wifi_channel)
 {
-  _name            = name;
+  _name             = name;
   _subscribed_topics = subscribed;
-  _topics_count    = topics_count;
-  _channel         = wifi_channel ? wifi_channel : 1;
+  _topics_count     = topics_count;
+  _channel          = wifi_channel ? wifi_channel : 1;
 
 #if defined(ARDUINO_ARCH_ESP32)
   WiFi.mode(WIFI_STA);
-  esp_wifi_set_ps(WIFI_PS_NONE);                         // pełna moc, bez sleep
-  esp_wifi_set_max_tx_power(78);                         // ~19.5 dBm
-  esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_LR); // long range
+  esp_wifi_set_ps(WIFI_PS_NONE);
+  esp_wifi_set_max_tx_power(78); // ~19.5 dBm
+  esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_LR);
   esp_wifi_set_channel(_channel, WIFI_SECOND_CHAN_NONE);
 
   if (esp_now_init() != ESP_OK) {
@@ -43,15 +40,14 @@ void MeshLib::initMesh(const char *name,
 
 #elif defined(ARDUINO_ARCH_ESP8266)
   WiFi.mode(WIFI_STA);
-  WiFi.setSleepMode(WIFI_NONE_SLEEP);                    // pełna moc, bez sleep
-  WiFi.setOutputPower(20.5f);                            // ~20.5 dBm
+  WiFi.setSleepMode(WIFI_NONE_SLEEP);
+  WiFi.setOutputPower(20.5f);
   wifi_set_channel(_channel);
 
   if (esp_now_init() != 0) {
     MESH_LOG("❌ ESP-NOW init failed (ESP8266)\n");
     while (true) delay(1000);
   }
-
   esp_now_set_self_role(ESP_NOW_ROLE_COMBO);
   esp_now_register_recv_cb(&_recvThunk);
 
@@ -64,25 +60,22 @@ void MeshLib::initMesh(const char *name,
            _name ? _name : "node", _channel, WiFi.macAddress().c_str());
 }
 
-// ====== send ======
 bool MeshLib::sendMessage(const standard_mesh_message &message) {
+  standard_mesh_message m = message;
+  if (m.ttl <= 0) m.ttl = MESH_DEFAULT_TTL;  // domyślny TTL
+
 #if defined(ARDUINO_ARCH_ESP32)
-  esp_err_t r = esp_now_send(BROADCAST_ADDR,
-                             reinterpret_cast<const uint8_t*>(&message),
-                             sizeof(message));
+  esp_err_t r = esp_now_send(BROADCAST_ADDR, reinterpret_cast<const uint8_t*>(&m), sizeof(m));
   return (r == ESP_OK);
 #else
-  int r = esp_now_send((uint8_t*)BROADCAST_ADDR,
-                       (uint8_t*)&message,
-                       (uint8_t)sizeof(message));
+  int r = esp_now_send((uint8_t*)BROADCAST_ADDR, (uint8_t*)&m, (uint8_t)sizeof(m));
   return (r == 0);
 #endif
 }
 
-// ====== discover ======
 bool MeshLib::sendDiscover(int ttl) {
   standard_mesh_message msg{};
-  msg.ttl = (ttl > 0) ? ttl : 1;
+  msg.ttl = (ttl > 0) ? ttl : MESH_DEFAULT_TTL;
   _fillSender(msg);
   strncpy(msg.type,  MESH_TYPE_CMD,           sizeof(msg.type)-1);
   strncpy(msg.topic, MESH_TOPIC_DISCOVER_GET, sizeof(msg.topic)-1);
@@ -90,7 +83,6 @@ bool MeshLib::sendDiscover(int ttl) {
   return sendMessage(msg);
 }
 
-// ====== thunk RX ======
 #if defined(ARDUINO_ARCH_ESP32)
 void MeshLib::_recvThunk(const uint8_t *mac, const uint8_t *data, int len) {
   if (_instance) _instance->_handleReceive(mac, data, len);
@@ -101,23 +93,22 @@ void MeshLib::_recvThunk(uint8_t *mac, uint8_t *data, uint8_t len) {
 }
 #endif
 
-// ====== RX handler ======
 void MeshLib::_handleReceive(const uint8_t *mac, const uint8_t *data, int len) {
   if (len != (int)sizeof(standard_mesh_message)) return;
 
   standard_mesh_message msg{};
   memcpy(&msg, data, sizeof(msg));
 
-  // --- binarny self-check po MAC z callbacka ---
+  // self MAC check (binarnie)
   uint8_t my[6];
 #if defined(ARDUINO_ARCH_ESP32)
   esp_wifi_get_mac(WIFI_IF_STA, my);
 #else
   wifi_get_macaddr(STATION_IF, my);
 #endif
-  if (memcmp(my, mac, 6) == 0) return; // moja własna ramka → ignoruj
+  if (memcmp(my, mac, 6) == 0) return;
 
-  // (Opcjonalnie) bypass dedupe dla toggle (0/1/ON/OFF) data
+  // bypass dla toggli?
 #if MESH_DEDUP_BYPASS_TOGGLES
   auto isToggle = [&](){
     if (!_equals(msg.type, MESH_TYPE_DATA)) return false;
@@ -132,18 +123,18 @@ void MeshLib::_handleReceive(const uint8_t *mac, const uint8_t *data, int len) {
   const bool bypass = false;
 #endif
 
-  // --- deduplikacja z oknem czasowym ---
+  // dedupe (okno czasowe)
   if (!bypass && _seenAndRemember(msg)) {
     MESH_LOG("↩️ dup drop %s/%s\n", msg.type, msg.topic);
     return;
   }
 
-  // --- automatyka CMD (np. discover) — PRZED filtrem subskrypcji ---
+  // auto-CMD
   if (_equals(msg.type, MESH_TYPE_CMD)) {
     _autoHandleCmd(msg);
   }
 
-  // --- filtr subów dla callbacka (0=wszystko) ---
+  // filtr subów → callback
   bool subscribed = (_topics_count == 0);
   for (int i = 0; !subscribed && i < _topics_count; ++i) {
     if (_equals(_subscribed_topics[i], msg.topic)) subscribed = true;
@@ -152,14 +143,17 @@ void MeshLib::_handleReceive(const uint8_t *mac, const uint8_t *data, int len) {
     _callback(msg);
   }
 
-  // --- flood z TTL i krótkim backoffem (mniej kolizji) ---
+  // forward z TTL + krótki backoff
   if (msg.ttl > 0) {
     msg.ttl -= 1;
     if (msg.ttl > 0) {
+#if MESH_LIB_LOG_ENABLED
+      MESH_LOG("↪️ forward: type=%s topic=%s ttl=%d\n", msg.type, msg.topic, msg.ttl);
+#endif
 #if defined(ARDUINO_ARCH_ESP32)
-      uint32_t us = 1000 + (esp_random() % 3000); // 1..4 ms
+      uint32_t us = 1000 + (esp_random() % 3000);
 #else
-      uint32_t us = 1000 + (random() % 3000);     // 1..4 ms
+      uint32_t us = 1000 + (random() % 3000);
 #endif
       delayMicroseconds(us);
 #if defined(ARDUINO_ARCH_ESP32)
@@ -171,7 +165,6 @@ void MeshLib::_handleReceive(const uint8_t *mac, const uint8_t *data, int len) {
   }
 }
 
-// ====== automatyka CMD ======
 void MeshLib::_autoHandleCmd(standard_mesh_message &msg) {
   if (_equals(msg.topic, MESH_TOPIC_DISCOVER_GET)) {
     _sendDiscoverPost();
@@ -180,7 +173,7 @@ void MeshLib::_autoHandleCmd(standard_mesh_message &msg) {
 
 void MeshLib::_sendDiscoverPost() {
   standard_mesh_message resp{};
-  resp.ttl = 1;
+  resp.ttl = MESH_DEFAULT_TTL;
   _fillSender(resp);
   strncpy(resp.type,  MESH_TYPE_CMD,            sizeof(resp.type)-1);
   strncpy(resp.topic, MESH_TOPIC_DISCOVER_POST, sizeof(resp.topic)-1);
@@ -199,7 +192,6 @@ void MeshLib::_sendDiscoverPost() {
   (void)sendMessage(resp);
 }
 
-// ====== helpers ======
 void MeshLib::_fillSender(standard_mesh_message &msg) const {
   String mac = WiFi.macAddress();
   strncpy(msg.sender, mac.c_str(), sizeof(msg.sender)-1);
@@ -210,7 +202,7 @@ bool MeshLib::_equals(const char *a, const char *b) {
   return strcmp(a, b) == 0;
 }
 
-// ====== deduplikacja (hash z oknem czasowym) ======
+// ===== DEDUPE =====
 void MeshLib::_dedupPurgeOld() {
   const uint32_t now = millis();
   for (int i = 0; i < DEDUP_MAX; ++i) {
@@ -222,7 +214,7 @@ void MeshLib::_dedupPurgeOld() {
 }
 
 uint32_t MeshLib::_hash32(const standard_mesh_message &m) {
-  // FNV-1a po kluczowych polach; BEZ TTL (TTL zmienia się przy hopach)
+  // FNV-1a po polach kluczowych (bez TTL)
   uint32_t h = 2166136261u;
   auto mix = [&](const char* s){
     if (!s) return;
@@ -238,23 +230,20 @@ uint32_t MeshLib::_hash32(const standard_mesh_message &m) {
 
 bool MeshLib::_seenAndRemember(const standard_mesh_message &m) {
   _dedupPurgeOld();
-
   const uint32_t now = millis();
   const uint32_t h = _hash32(m);
 
-  // znajdź istniejący wpis
   for (int i = 0; i < DEDUP_MAX; ++i) {
     if (_dedup[i].h == h) {
       if ((now - _dedup[i].ts) <= (uint32_t)MESH_DEDUP_WINDOW_MS) {
-        return true;              // świeży duplikat → drop
+        return true;     // świeży duplikat
       } else {
-        _dedup[i].ts = now;       // przeterminowany → odśwież
+        _dedup[i].ts = now; // odśwież i przepuść
         return false;
       }
     }
   }
 
-  // brak wpisu → dodaj nowy
   _dedup[_dedup_idx].h  = h;
   _dedup[_dedup_idx].ts = now;
   _dedup_idx = (_dedup_idx + 1) % DEDUP_MAX;
