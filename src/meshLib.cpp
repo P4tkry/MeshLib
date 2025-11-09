@@ -117,8 +117,23 @@ void MeshLib::_handleReceive(const uint8_t *mac, const uint8_t *data, int len) {
 #endif
   if (memcmp(my, mac, 6) == 0) return; // moja własna ramka → ignoruj
 
-  // --- deduplikacja (FIFO z ostatnich ramek) ---
-  if (_seenAndRemember(msg)) {
+  // (Opcjonalnie) bypass dedupe dla toggle (0/1/ON/OFF) data
+#if MESH_DEDUP_BYPASS_TOGGLES
+  auto isToggle = [&](){
+    if (!_equals(msg.type, MESH_TYPE_DATA)) return false;
+    if (msg.payload[0]=='0' && msg.payload[1]==0) return true;
+    if (msg.payload[0]=='1' && msg.payload[1]==0) return true;
+    if (strcasecmp(msg.payload,"ON")==0)  return true;
+    if (strcasecmp(msg.payload,"OFF")==0) return true;
+    return false;
+  };
+  const bool bypass = isToggle();
+#else
+  const bool bypass = false;
+#endif
+
+  // --- deduplikacja z oknem czasowym ---
+  if (!bypass && _seenAndRemember(msg)) {
     MESH_LOG("↩️ dup drop %s/%s\n", msg.type, msg.topic);
     return;
   }
@@ -128,7 +143,7 @@ void MeshLib::_handleReceive(const uint8_t *mac, const uint8_t *data, int len) {
     _autoHandleCmd(msg);
   }
 
-  // --- filtr subów dla callbacka użytkownika (0=wszystko) ---
+  // --- filtr subów dla callbacka (0=wszystko) ---
   bool subscribed = (_topics_count == 0);
   for (int i = 0; !subscribed && i < _topics_count; ++i) {
     if (_equals(_subscribed_topics[i], msg.topic)) subscribed = true;
@@ -141,7 +156,6 @@ void MeshLib::_handleReceive(const uint8_t *mac, const uint8_t *data, int len) {
   if (msg.ttl > 0) {
     msg.ttl -= 1;
     if (msg.ttl > 0) {
-      // losowy mikro-backoff
 #if defined(ARDUINO_ARCH_ESP32)
       uint32_t us = 1000 + (esp_random() % 3000); // 1..4 ms
 #else
@@ -196,9 +210,19 @@ bool MeshLib::_equals(const char *a, const char *b) {
   return strcmp(a, b) == 0;
 }
 
-// ====== deduplikacja ======
+// ====== deduplikacja (hash z oknem czasowym) ======
+void MeshLib::_dedupPurgeOld() {
+  const uint32_t now = millis();
+  for (int i = 0; i < DEDUP_MAX; ++i) {
+    if (_dedup[i].h != 0 && (now - _dedup[i].ts) > (uint32_t)MESH_DEDUP_WINDOW_MS) {
+      _dedup[i].h = 0;
+      _dedup[i].ts = 0;
+    }
+  }
+}
+
 uint32_t MeshLib::_hash32(const standard_mesh_message &m) {
-  // prosty FNV-1a po kluczowych polach
+  // FNV-1a po kluczowych polach; BEZ TTL (TTL zmienia się przy hopach)
   uint32_t h = 2166136261u;
   auto mix = [&](const char* s){
     if (!s) return;
@@ -208,17 +232,31 @@ uint32_t MeshLib::_hash32(const standard_mesh_message &m) {
   mix(m.type);
   mix(m.topic);
   mix(m.payload);
-  h ^= (uint32_t)m.ttl; h *= 16777619u;
   if (h == 0) h = 1;
   return h;
 }
 
 bool MeshLib::_seenAndRemember(const standard_mesh_message &m) {
-  uint32_t h = _hash32(m);
+  _dedupPurgeOld();
+
+  const uint32_t now = millis();
+  const uint32_t h = _hash32(m);
+
+  // znajdź istniejący wpis
   for (int i = 0; i < DEDUP_MAX; ++i) {
-    if (_dedup[i] == h) return true;
+    if (_dedup[i].h == h) {
+      if ((now - _dedup[i].ts) <= (uint32_t)MESH_DEDUP_WINDOW_MS) {
+        return true;              // świeży duplikat → drop
+      } else {
+        _dedup[i].ts = now;       // przeterminowany → odśwież
+        return false;
+      }
+    }
   }
-  _dedup[_dedup_idx] = h;
+
+  // brak wpisu → dodaj nowy
+  _dedup[_dedup_idx].h  = h;
+  _dedup[_dedup_idx].ts = now;
   _dedup_idx = (_dedup_idx + 1) % DEDUP_MAX;
   return false;
 }
