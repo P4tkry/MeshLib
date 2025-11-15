@@ -9,7 +9,9 @@
   #include <esp_now.h>
 #elif defined(ARDUINO_ARCH_ESP8266)
   #include <ESP8266WiFi.h>
-  extern "C" { #include <user_interface.h> }
+  extern "C" { 
+    #include <user_interface.h>
+   }
   #include <espnow.h>
 #else
   #error "MeshLib supports only ESP32 and ESP8266"
