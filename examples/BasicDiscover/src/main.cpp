@@ -1,34 +1,57 @@
 #include <Arduino.h>
 #include <meshLib.h>
 
-static void onMsg(const standard_mesh_message &msg) {
-  Serial.printf("[APP] RX type=%s topic=%s from=%s payload='%s' ttl=%d\n",
-                msg.type, msg.topic, msg.sender, msg.payload, msg.ttl);
+// ==================== CALLBACK ====================
+// Wywoływany przy każdej odebranej wiadomości mesh
+void onMeshReceive(const standard_mesh_message &msg) {
+    Serial.print("[RX]  mid=");
+    Serial.print(msg.mid);
+    Serial.print("  sender=");
+    Serial.print(msg.sender);
+    Serial.print("  type=");
+    Serial.print(msg.type);
+    Serial.print("  topic=");
+    Serial.print(msg.topic);
+    Serial.print("  payload=");
+    Serial.print(msg.payload);
+    Serial.print("  ttl=");
+    Serial.println(msg.ttl);
 }
 
-const char* SUBS[] = {
-  MESH_TOPIC_DISCOVER_POST,
-  "led/state"
-};
+// ==================== MESH ====================
+MeshLib mesh(onMeshReceive);
 
-MeshLib mesh(onMsg);
+unsigned long lastSend = 0;
 
 void setup() {
-  Serial.begin(115200);
-  delay(500);
-  mesh.initMesh("node-01", SUBS, 2, 1);
-  mesh.sendDiscover(2);
+    Serial.begin(115200);
+    delay(200);
+
+    Serial.println("\n=== Basic Mesh Test ===");
+
+    // Nie subskrybujemy nic → odbieramy wszystko
+    mesh.initMesh("Node", nullptr, 0, 1);
+
+    Serial.println("[INIT] Mesh ready");
 }
 
 void loop() {
-  static uint32_t t = 0;
-  if (millis() - t > 3000) {
-    t = millis();
-    standard_mesh_message msg{};
-    msg.ttl = 2;
-    strncpy(msg.type,  MESH_TYPE_DATA, sizeof(msg.type)-1);
-    strncpy(msg.topic, "led/state",    sizeof(msg.topic)-1);
-    strncpy(msg.payload, "on",         sizeof(msg.payload)-1);
-    mesh.sendMessage(msg);
-  }
+    unsigned long now = millis();
+
+    // Co 5 sekund nadajemy testową wiadomość
+    if (now - lastSend > 5000) {
+        lastSend = now;
+
+        standard_mesh_message m{};
+        m.ttl = 3;  // coś do przetestowania forwarding
+        strncpy(m.type,  "data", sizeof(m.type));
+        strncpy(m.topic, "test/hello", sizeof(m.topic));
+        strncpy(m.payload, "Hello from node!", sizeof(m.payload));
+
+        bool ok = mesh.sendMessage(m);
+
+        Serial.print("[TX] ");
+        Serial.print(ok ? "Sent OK" : "Send FAIL");
+        Serial.print("  (MID assigned automatically)\n");
+    }
 }

@@ -1,99 +1,108 @@
-#ifndef MESHLIB_H
-#define MESHLIB_H
+#pragma once
 
 #include <Arduino.h>
 
 #if defined(ARDUINO_ARCH_ESP32)
   #include <WiFi.h>
-  #include <esp_wifi.h>
-  #include <esp_now.h>
 #elif defined(ARDUINO_ARCH_ESP8266)
   #include <ESP8266WiFi.h>
-  extern "C" { 
-    #include <user_interface.h>
-   }
-  #include <espnow.h>
-#else
-  #error "MeshLib supports only ESP32 and ESP8266"
 #endif
 
-// ===== Konfiguracja logów =====
-// Włącz w platformio.ini: -DMESH_LIB_LOG_ENABLED=1
-#ifndef MESH_LIB_LOG_ENABLED
-  #define MESH_LIB_LOG_ENABLED 0
-#endif
-#if MESH_LIB_LOG_ENABLED
-  #define MESH_LOG(...) do { Serial.printf(__VA_ARGS__); } while(0)
-#else
-  #define MESH_LOG(...) do {} while(0)
-#endif
+// ================== KONFIGURACJA / DOMYŚLNE ==================
 
-// Domyślny TTL dla wiadomości tworzonych lokalnie
 #ifndef MESH_DEFAULT_TTL
-  #define MESH_DEFAULT_TTL 2
+#define MESH_DEFAULT_TTL        4
 #endif
 
-// Deduplikacja: identyczny (sender+type+topic+payload) w tym oknie → drop
 #ifndef MESH_DEDUP_WINDOW_MS
-  #define MESH_DEDUP_WINDOW_MS 1000
+#define MESH_DEDUP_WINDOW_MS    3000
 #endif
 
-// Przepuszczaj zawsze „toggle” (0/1/ON/OFF) mimo dedupe? 0/1
-#ifndef MESH_DEDUP_BYPASS_TOGGLES
-  #define MESH_DEDUP_BYPASS_TOGGLES 0
+#ifndef DEDUP_MAX
+#define DEDUP_MAX               32
 #endif
 
-// Protokół
-#define MESH_TYPE_DATA  "data"
-#define MESH_TYPE_CMD   "cmd"
+#ifndef MESH_LIB_LOG_ENABLED
+#define MESH_LIB_LOG_ENABLED    1
+#endif
+
+#if MESH_LIB_LOG_ENABLED
+  #define MESH_LOG(...)  Serial.printf(__VA_ARGS__)
+#else
+  #define MESH_LOG(...)
+#endif
+
+#ifndef MESH_TYPE_CMD
+#define MESH_TYPE_CMD           "cmd"
+#endif
+
+#ifndef MESH_TYPE_DATA
+#define MESH_TYPE_DATA          "data"
+#endif
+
+#ifndef MESH_TOPIC_DISCOVER_GET
 #define MESH_TOPIC_DISCOVER_GET  "discover/get"
+#endif
+
+#ifndef MESH_TOPIC_DISCOVER_POST
 #define MESH_TOPIC_DISCOVER_POST "discover/post"
+#endif
 
-// Struktura wiadomości (<= 250 B)
-typedef struct standard_mesh_message {
-  int  ttl;          // ile hopów jeszcze
-  char sender[32];   // MAC nadawcy (tekstowo)
-  char type[16];     // "data"/"cmd"
-  char topic[32];    // np. "workshop/fan"
-  char payload[140]; // dane/polecenie
-} standard_mesh_message;
+#ifndef MESH_DEDUP_BYPASS_TOGGLES
+#define MESH_DEDUP_BYPASS_TOGGLES 1
+#endif
 
-static_assert(sizeof(standard_mesh_message) <= 250, "Mesh message too big for ESP-NOW");
+// ================== STRUKTURA WIADOMOŚCI ==================
+
+struct standard_mesh_message {
+  char sender[18];    // MAC jako string "AA:BB:CC:DD:EE:FF"
+  char type[16];
+  char topic[64];
+  char payload[140];
+  int16_t ttl;
+  uint32_t mid;       // NOWE: Message ID do deduplikacji
+};
+
+// ================== KLASA MeshLib ==================
 
 class MeshLib {
 public:
-  using ReceiveCallback = void (*)(const standard_mesh_message &msg);
+  using ReceiveCallback = void(*)(const standard_mesh_message&);
 
   explicit MeshLib(ReceiveCallback cb);
 
-  // topics_count==0 → callback dostaje wszystko
   void initMesh(const char *name,
                 const char *subscribed[],
                 int topics_count,
                 uint8_t wifi_channel);
 
-  // Wysyłka broadcast (użyj MESH_DEFAULT_TTL, jeśli message.ttl==0)
   bool sendMessage(const standard_mesh_message &message);
-
-  // Rozgłoś discover/get
   bool sendDiscover(int ttl);
 
 private:
+  // instancja singletona dla callbacków ESP-NOW
+  static MeshLib* _instance;
+
+  const char *_name = nullptr;
   const char **_subscribed_topics = nullptr;
-  int          _topics_count = 0;
-  const char  *_name = nullptr;
-  uint8_t      _channel = 1;
+  int _topics_count = 0;
+  uint8_t _channel = 1;
 
   ReceiveCallback _callback = nullptr;
 
-  // Deduplikacja
-  static const int DEDUP_MAX = 24;
-  struct DedupEntry { uint32_t h; uint32_t ts; };
-  DedupEntry _dedup[DEDUP_MAX] = {};
-  int        _dedup_idx = 0;
+  // ---- DEDUP po MID ----
+  struct DedupEntry {
+    uint32_t mid;
+    uint32_t ts;
+  };
 
-  static MeshLib *_instance;
+  DedupEntry _dedup[DEDUP_MAX]{};
+  int _dedup_idx = 0;
 
+  uint16_t _nodeId = 0;        // wyciągnięty z binarnego MACa
+  uint32_t _midCounter = 1;    // lokalny licznik MID
+
+  // wewnętrzne: thunk + obsługa odbioru
 #if defined(ARDUINO_ARCH_ESP32)
   static void _recvThunk(const uint8_t *mac, const uint8_t *data, int len);
 #else
@@ -103,14 +112,12 @@ private:
   void _handleReceive(const uint8_t *mac, const uint8_t *data, int len);
   void _autoHandleCmd(standard_mesh_message &msg);
   void _sendDiscoverPost();
-
-  void     _fillSender(standard_mesh_message &msg) const;
+  void _fillSender(standard_mesh_message &msg) const;
+  void _fillMid(standard_mesh_message &msg);
   static bool _equals(const char *a, const char *b);
 
-  // Dedupe
-  static uint32_t _hash32(const standard_mesh_message &m);
+  // dedup
   void _dedupPurgeOld();
   bool _seenAndRemember(const standard_mesh_message &m);
 };
 
-#endif // MESHLIB_H
