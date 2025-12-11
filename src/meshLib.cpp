@@ -15,6 +15,14 @@ static const uint8_t BROADCAST_ADDR[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 
 MeshLib *MeshLib::_instance = nullptr;
 
+uint32_t MeshLib::rand32() {
+#if defined(ARDUINO_ARCH_ESP32)
+  return esp_random();
+#else
+  return (uint32_t(random()) << 16) ^ uint32_t(random());
+#endif
+}
+
 // ================== KONSTRUKTOR ==================
 
 MeshLib::MeshLib(ReceiveCallback cb)
@@ -24,8 +32,6 @@ MeshLib::MeshLib(ReceiveCallback cb)
   _topics_count = 0;
   _channel      = 1;
   _dedup_idx    = 0;
-  _nodeId       = 0;
-  _midCounter   = 1;
   // _dedup jest wyzerowany przez in-class init / statyczną inicjalizację
 }
 
@@ -83,14 +89,20 @@ void MeshLib::initMesh(const char *name,
 
 #endif
 
-  // Prosty nodeId z binarnego MACa (2 ostatnie bajty)
   uint8_t mac_bin[6];
 #if defined(ARDUINO_ARCH_ESP32)
   esp_wifi_get_mac(WIFI_IF_STA, mac_bin);
 #else
   wifi_get_macaddr(STATION_IF, mac_bin);
 #endif
-  _nodeId = (uint16_t(mac_bin[4]) << 8) | mac_bin[5];
+
+  // ziarno RNG: MAC + czas uruchomienia, żeby MID-y były losowe per urządzenie
+  uint32_t seed = (uint32_t(mac_bin[2]) << 24) |
+                  (uint32_t(mac_bin[3]) << 16) |
+                  (uint32_t(mac_bin[4]) << 8)  |
+                  uint32_t(mac_bin[5]);
+  seed ^= millis();
+  randomSeed(seed);
 
   MESH_LOG("✅ MeshLib: %s ready (ch=%u, MAC=%s)\n",
            _name ? _name : "node", _channel, WiFi.macAddress().c_str());
@@ -98,12 +110,13 @@ void MeshLib::initMesh(const char *name,
 
 // ================== WYSYŁANIE ==================
 
-bool MeshLib::sendMessage(const standard_mesh_message &message) {
+bool MeshLib::_sendMessage(const standard_mesh_message &message) {
   standard_mesh_message m = message;
   if (m.ttl <= 0) m.ttl = MESH_DEFAULT_TTL;  // domyślny TTL
 
   _fillSender(m); // na wszelki wypadek, gdyby aplikacja nie ustawiła
   _fillMid(m);    // NOWE: nadaj MID, jeżeli brak
+  (void)_seenAndRemember(m); // zapisz własny MID, by nie forwardować po zawróceniu
 
 #if defined(ARDUINO_ARCH_ESP32)
   esp_err_t r = esp_now_send(BROADCAST_ADDR,
@@ -118,6 +131,26 @@ bool MeshLib::sendMessage(const standard_mesh_message &message) {
 #endif
 }
 
+bool MeshLib::sendMessage(const char *topic, const char *payload, int ttl) {
+  standard_mesh_message m{};
+  m.ttl = (ttl > 0) ? ttl : MESH_DEFAULT_TTL;
+  _fillSender(m);
+  strncpy(m.type,  MESH_TYPE_DATA, sizeof(m.type) - 1);
+  if (topic)   strncpy(m.topic,   topic,   sizeof(m.topic) - 1);
+  if (payload) strncpy(m.payload, payload, sizeof(m.payload) - 1);
+  return _sendMessage(m);
+}
+
+bool MeshLib::sendCmd(const char *topic, const char *payload, int ttl) {
+  standard_mesh_message m{};
+  m.ttl = (ttl > 0) ? ttl : MESH_DEFAULT_TTL;
+  _fillSender(m);
+  strncpy(m.type,  MESH_TYPE_CMD, sizeof(m.type) - 1);
+  if (topic)   strncpy(m.topic,   topic,   sizeof(m.topic) - 1);
+  if (payload) strncpy(m.payload, payload, sizeof(m.payload) - 1);
+  return _sendMessage(m);
+}
+
 bool MeshLib::sendDiscover(int ttl) {
   standard_mesh_message msg{};
   msg.ttl = (ttl > 0) ? ttl : MESH_DEFAULT_TTL;
@@ -126,7 +159,7 @@ bool MeshLib::sendDiscover(int ttl) {
   strncpy(msg.topic, MESH_TOPIC_DISCOVER_GET, sizeof(msg.topic)-1);
   msg.payload[0] = '\0';
   // MID zostanie nadany w sendMessage()
-  return sendMessage(msg);
+  return _sendMessage(msg);
 }
 
 // ================== RECV THUNK ==================
@@ -160,23 +193,8 @@ void MeshLib::_handleReceive(const uint8_t *mac, const uint8_t *data, int len) {
 #endif
   if (memcmp(my, mac, 6) == 0) return;  // ignoruj własne ramki
 
-  // bypass dla toggli (ON/OFF/0/1)
-#if MESH_DEDUP_BYPASS_TOGGLES
-  auto isToggle = [&](){
-    if (!_equals(msg.type, MESH_TYPE_DATA)) return false;
-    if (msg.payload[0]=='0' && msg.payload[1]==0) return true;
-    if (msg.payload[0]=='1' && msg.payload[1]==0) return true;
-    if (strcasecmp(msg.payload,"ON")==0)  return true;
-    if (strcasecmp(msg.payload,"OFF")==0) return true;
-    return false;
-  };
-  const bool bypass = isToggle();
-#else
-  const bool bypass = false;
-#endif
-
-  // dedupe (okno czasowe) – po MID
-  if (!bypass && _seenAndRemember(msg)) {
+  // dedupe po MID
+  if (_seenAndRemember(msg)) {
 #if MESH_LIB_LOG_ENABLED
     MESH_LOG("↩️ dup drop mid=%lu type=%s topic=%s\n",
              (unsigned long)msg.mid, msg.type, msg.topic);
@@ -202,6 +220,17 @@ void MeshLib::_handleReceive(const uint8_t *mac, const uint8_t *data, int len) {
   if (msg.ttl > 0) {
     msg.ttl -= 1;
     if (msg.ttl > 0) {
+      // CMD packets with target MAC: forward tylko jeśli nie dla nas
+      if (_equals(msg.type, MESH_TYPE_CMD) &&
+          (_equals(msg.topic, MESH_TOPIC_OTA_START) || _equals(msg.topic, MESH_TOPIC_REBOOT))) {
+        char target_mac[18];
+        if (_parseTargetMac(msg.payload, target_mac, sizeof(target_mac)) && _isForUs(target_mac)) {
+#if MESH_LIB_LOG_ENABLED
+          MESH_LOG("⛔ %s packet for us (no forward)\n", msg.topic);
+#endif
+          return;
+        }
+      }
 #if MESH_LIB_LOG_ENABLED
       MESH_LOG("↪️ forward: mid=%lu type=%s topic=%s ttl=%d\n",
                (unsigned long)msg.mid, msg.type, msg.topic, msg.ttl);
@@ -213,11 +242,17 @@ void MeshLib::_handleReceive(const uint8_t *mac, const uint8_t *data, int len) {
 #endif
       delayMicroseconds(us);
 #if defined(ARDUINO_ARCH_ESP32)
-      esp_now_send(BROADCAST_ADDR, (uint8_t*)&msg, sizeof(msg));
+      esp_err_t r = esp_now_send(BROADCAST_ADDR, (uint8_t*)&msg, sizeof(msg));
+      if (r != ESP_OK) {
+        MESH_LOG("⚠️ forward send failed: mid=%lu err=%d\n", (unsigned long)msg.mid, r);
+      }
 #else
-      esp_now_send((uint8_t*)BROADCAST_ADDR,
-                   (uint8_t*)&msg,
-                   (uint8_t)sizeof(msg));
+      int r = esp_now_send((uint8_t*)BROADCAST_ADDR,
+                           (uint8_t*)&msg,
+                           (uint8_t)sizeof(msg));
+      if (r != 0) {
+        MESH_LOG("⚠️ forward send failed: mid=%lu err=%d\n", (unsigned long)msg.mid, r);
+      }
 #endif
     }
   }
@@ -228,6 +263,10 @@ void MeshLib::_handleReceive(const uint8_t *mac, const uint8_t *data, int len) {
 void MeshLib::_autoHandleCmd(standard_mesh_message &msg) {
   if (_equals(msg.topic, MESH_TOPIC_DISCOVER_GET)) {
     _sendDiscoverPost();
+  } else if (_equals(msg.topic, MESH_TOPIC_OTA_START)) {
+    _handleOTARequest(msg);
+  } else if (_equals(msg.topic, MESH_TOPIC_REBOOT)) {
+    _handleRebootRequest(msg);
   }
 }
 
@@ -250,7 +289,25 @@ void MeshLib::_sendDiscoverPost() {
            _name ? _name : "node", mac.c_str(), chip, _channel);
 
   // MID zostanie nadany w sendMessage()
-  (void)sendMessage(resp);
+  (void)_sendMessage(resp);
+}
+
+void MeshLib::_handleRebootRequest(const standard_mesh_message &msg) {
+  char target_mac[18];
+  if (_parseTargetMac(msg.payload, target_mac, sizeof(target_mac)) && _isForUs(target_mac)) {
+#if MESH_LIB_LOG_ENABLED
+    MESH_LOG("🔄 Reboot command received for us\n");
+#endif
+    _reboot_pending = true;
+  }
+}
+
+void MeshLib::_doReboot() {
+#if MESH_LIB_LOG_ENABLED
+  MESH_LOG("🔄 Rebooting now...\n");
+#endif
+  delay(500);
+  ESP.restart();
 }
 
 // ================== POMOCNICZE ==================
@@ -261,61 +318,87 @@ void MeshLib::_fillSender(standard_mesh_message &msg) const {
   strncpy(msg.sender, mac.c_str(), sizeof(msg.sender)-1);
 }
 
+
 void MeshLib::_fillMid(standard_mesh_message &msg) {
   if (msg.mid != 0) return; // aplikacja mogła sama ustawić MID
 
-  uint32_t local = _midCounter++;
-  msg.mid = (uint32_t(_nodeId) << 16) | (local & 0xFFFFu);
+  uint32_t mid = 0;
+  // losowy MID z ziarna mac+time, unikamy zera
+  do {
+    mid = MeshLib::rand32();
+  } while (mid == 0);
 
-  if (msg.mid == 0) {
-    msg.mid = 1; // unikamy 0 jako "brak MID"
-  }
+  msg.mid = mid;
 }
+
 
 bool MeshLib::_equals(const char *a, const char *b) {
   if (!a || !b) return false;
   return strcmp(a, b) == 0;
 }
 
-// ================== DEDUP PO MID ==================
-
-void MeshLib::_dedupPurgeOld() {
-  const uint32_t now = millis();
-  for (int i = 0; i < DEDUP_MAX; ++i) {
-    if (_dedup[i].mid != 0 &&
-        (now - _dedup[i].ts) > (uint32_t)MESH_DEDUP_WINDOW_MS) {
-      _dedup[i].mid = 0;
-      _dedup[i].ts  = 0;
-    }
-  }
+bool MeshLib::_parseTargetMac(const char *payload, char *out_mac, size_t mac_size) const {
+  if (!payload || !out_mac || mac_size < 18) return false;
+  
+  const char *mac_start = strstr(payload, "mac=");
+  if (!mac_start) return false;
+  
+  mac_start += 4;
+  const char *mac_end = strchr(mac_start, ';');
+  if (!mac_end) mac_end = mac_start + strlen(mac_start);
+  
+  size_t len = mac_end - mac_start;
+  if (len >= mac_size) return false;
+  
+  strncpy(out_mac, mac_start, len);
+  out_mac[len] = '\0';
+  return true;
 }
 
+bool MeshLib::_isForUs(const char *target_mac) const {
+  if (!target_mac || target_mac[0] == '\0') return false;
+  String our_mac = WiFi.macAddress();
+  return _equals(target_mac, our_mac.c_str());
+}
+
+// ================== DEDUP PO MID ==================
+
 bool MeshLib::_seenAndRemember(const standard_mesh_message &m) {
-  _dedupPurgeOld();
-  const uint32_t now = millis();
   const uint32_t mid = m.mid;
 
-  // wiadomość bez MID (0) – nie deduplikujemy (np. ze starego noda)
-  if (mid == 0) {
-    return false;
-  }
+  if (mid == 0) return false; // brak MID -> nie deduplikujemy
 
   for (int i = 0; i < DEDUP_MAX; ++i) {
     if (_dedup[i].mid == mid) {
-      if ((now - _dedup[i].ts) <= (uint32_t)MESH_DEDUP_WINDOW_MS) {
-        return true;     // świeży duplikat
-      } else {
-        // stary wpis – odśwież timestamp, przepuść
-        _dedup[i].ts = now;
-        return false;
-      }
+      return true; // widziany wcześniej
     }
   }
 
   // nowy MID – zapisz w buforze cyklicznym
   _dedup[_dedup_idx].mid = mid;
-  _dedup[_dedup_idx].ts  = now;
   _dedup_idx = (_dedup_idx + 1) % DEDUP_MAX;
+  return false;
+}
 
+bool MeshLib::loop() {
+  // Execute pending reboot outside of ESP-NOW callback context
+  if (_reboot_pending) {
+    _reboot_pending = false;
+    _doReboot();
+    return true;
+  }
+
+  // Pick up pending OTA request outside of ESP-NOW callback context
+  if (!_ota_mode && _ota_pending) {
+    ota_request req = _ota_req; // make a local copy
+    _ota_pending = false;
+    _enterOTAMode(req.ssid, req.passwd, req.ip);
+  }
+
+  // When OTA mode is active, prioritize OTA handling and signal caller
+  if (_ota_mode) {
+    _handleOTA();
+    return true;
+  }
   return false;
 }
