@@ -82,7 +82,8 @@ public:
   void initMesh(const char *name,
                 const char *subscribed[],
                 int topics_count,
-                uint8_t wifi_channel);
+                uint8_t wifi_channel,
+                bool power_save = false);
 
   bool sendMessage(const char *topic, const char *payload, int ttl = -1);
   bool sendCmd(const char *topic, const char *payload, int ttl = -1);
@@ -123,7 +124,13 @@ private:
   ota_request _ota_req{};
   // Defer reboot from callback context
   volatile bool _reboot_pending = false;
-  
+
+#if defined(ARDUINO_ARCH_ESP32)
+  portMUX_TYPE _stateMux = portMUX_INITIALIZER_UNLOCKED;
+#endif
+  void _lockState();
+  void _unlockState();
+
 
   // wewnętrzne: thunk + obsługa odbioru
 #if defined(ARDUINO_ARCH_ESP32)

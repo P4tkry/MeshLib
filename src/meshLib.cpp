@@ -1,4 +1,6 @@
 #include "meshLib.h"
+#include <ArduinoOTA.h>
+#include <ctype.h>
 
 #if defined(ARDUINO_ARCH_ESP32)
   #include <esp_wifi.h>
@@ -12,6 +14,16 @@
 
 // Broadcast FF:FF:FF:FF:FF:FF
 static const uint8_t BROADCAST_ADDR[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+
+static bool equalsIgnoreCase(const char *a, const char *b) {
+  if (!a || !b) return false;
+  while (*a && *b) {
+    if (tolower(static_cast<unsigned char>(*a)) != tolower(static_cast<unsigned char>(*b))) return false;
+    ++a;
+    ++b;
+  }
+  return (*a == '\0' && *b == '\0');
+}
 
 MeshLib *MeshLib::_instance = nullptr;
 
@@ -35,12 +47,29 @@ MeshLib::MeshLib(ReceiveCallback cb)
   // _dedup jest wyzerowany przez in-class init / statyczną inicjalizację
 }
 
+void MeshLib::_lockState() {
+#if defined(ARDUINO_ARCH_ESP32)
+  portENTER_CRITICAL(&_stateMux);
+#else
+  noInterrupts();
+#endif
+}
+
+void MeshLib::_unlockState() {
+#if defined(ARDUINO_ARCH_ESP32)
+  portEXIT_CRITICAL(&_stateMux);
+#else
+  interrupts();
+#endif
+}
+
 // ================== INIT MESH ==================
 
 void MeshLib::initMesh(const char *name,
                        const char *subscribed[],
                        int topics_count,
-                       uint8_t wifi_channel)
+                       uint8_t wifi_channel,
+                       bool power_save)
 {
   _name              = name;
   _subscribed_topics = subscribed;
@@ -50,7 +79,11 @@ void MeshLib::initMesh(const char *name,
 #if defined(ARDUINO_ARCH_ESP32)
 
   WiFi.mode(WIFI_STA);
-  esp_wifi_set_ps(WIFI_PS_NONE);
+  if (power_save) {
+    esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+  } else {
+    esp_wifi_set_ps(WIFI_PS_NONE);
+  }
   esp_wifi_set_max_tx_power(78); // ~19.5 dBm
   esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_LR);
   esp_wifi_set_channel(_channel, WIFI_SECOND_CHAN_NONE);
@@ -72,7 +105,11 @@ void MeshLib::initMesh(const char *name,
 #elif defined(ARDUINO_ARCH_ESP8266)
 
   WiFi.mode(WIFI_STA);
-  WiFi.setSleepMode(WIFI_NONE_SLEEP);
+  if (power_save) {
+    WiFi.setSleepMode(WIFI_MODEM_SLEEP);
+  } else {
+    WiFi.setSleepMode(WIFI_NONE_SLEEP);
+  }
   WiFi.setOutputPower(20.5f);
   wifi_set_channel(_channel);
 
@@ -292,13 +329,182 @@ void MeshLib::_sendDiscoverPost() {
   (void)_sendMessage(resp);
 }
 
+static bool extractField(const char *payload, const char *key, char *out, size_t out_size) {
+  if (!payload || !key || !out || out_size == 0) return false;
+
+  const size_t key_len = strlen(key);
+  const char *pos = payload;
+  while ((pos = strstr(pos, key)) != nullptr) {
+    const bool at_start = (pos == payload);
+    const bool after_sep = (!at_start && *(pos - 1) == ';');
+    if (at_start || after_sep) {
+      const char *value = pos + key_len;
+      const char *end = strchr(value, ';');
+      if (!end) end = value + strlen(value);
+
+      const size_t len = size_t(end - value);
+      if (len == 0 || len >= out_size) return false;
+
+      memcpy(out, value, len);
+      out[len] = '\0';
+      return true;
+    }
+    pos += key_len;
+  }
+
+  return false;
+}
+
+void MeshLib::_handleOTARequest(const standard_mesh_message &msg) {
+  char target_mac[18] = {0};
+  if (!_parseTargetMac(msg.payload, target_mac, sizeof(target_mac)) || !_isForUs(target_mac)) {
+    return;
+  }
+
+  ota_request req{};
+  if (!extractField(msg.payload, "ssid=", req.ssid, sizeof(req.ssid))) {
+#if MESH_LIB_LOG_ENABLED
+    MESH_LOG("⚠️ ota/start ignored: missing ssid\n");
+#endif
+    return;
+  }
+
+  if (!extractField(msg.payload, "passwd=", req.passwd, sizeof(req.passwd))) {
+    req.passwd[0] = '\0';
+  }
+
+  strncpy(req.target_mac, target_mac, sizeof(req.target_mac) - 1);
+  if (!extractField(msg.payload, "ip=", req.ip, sizeof(req.ip))) {
+    req.ip[0] = '\0';
+  }
+
+  _lockState();
+  _ota_req = req;
+  _ota_pending = true;
+  _unlockState();
+#if MESH_LIB_LOG_ENABLED
+  MESH_LOG("📦 OTA queued for %s (ssid=%s, ip=%s)\n",
+           req.target_mac,
+           req.ssid,
+           req.ip[0] ? req.ip : "dhcp");
+#endif
+}
+
+void MeshLib::_enterOTAMode(const char *ssid, const char *passwd, const char *ip) {
+  if (_ota_mode) return;
+
+#if MESH_LIB_LOG_ENABLED
+  MESH_LOG("🚀 Entering OTA mode...\n");
+#endif
+
+#if defined(ARDUINO_ARCH_ESP32)
+  esp_now_deinit();
+  esp_wifi_set_ps(WIFI_PS_NONE);
+#else
+  esp_now_deinit();
+  WiFi.setSleepMode(WIFI_NONE_SLEEP);
+#endif
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(true);
+  delay(50);
+
+  if (ip && ip[0]) {
+    IPAddress static_ip;
+    if (static_ip.fromString(ip)) {
+      IPAddress gateway = static_ip;
+      gateway[3] = 1;
+      IPAddress subnet(255, 255, 255, 0);
+      WiFi.config(static_ip, gateway, subnet, gateway);
+    }
+  }
+
+  WiFi.begin(ssid ? ssid : "", passwd ? passwd : "");
+  for (int i = 0; i < 50 && WiFi.status() != WL_CONNECTED; ++i) {
+    delay(300);
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+#if MESH_LIB_LOG_ENABLED
+    MESH_LOG("❌ OTA WiFi connect failed, restarting...\n");
+#endif
+    _exitOTAMode();
+    return;
+  }
+
+  ArduinoOTA.setHostname(_name ? _name : "mesh-node");
+  ArduinoOTA.onStart([]() {
+#if MESH_LIB_LOG_ENABLED
+    MESH_LOG("⬆️ OTA start\n");
+#endif
+    if (MeshLib::_instance) MeshLib::_instance->_ota_start_time = millis();
+  });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    if (MeshLib::_instance) MeshLib::_instance->_ota_start_time = millis();
+#if MESH_LIB_LOG_ENABLED
+    const unsigned int pct = (total == 0) ? 0 : (progress * 100U) / total;
+    MESH_LOG("⬆️ OTA progress: %u%%\r", pct);
+#endif
+  });
+  ArduinoOTA.onEnd([]() {
+#if MESH_LIB_LOG_ENABLED
+    MESH_LOG("\n✅ OTA complete, reboot scheduled\n");
+#endif
+    if (MeshLib::_instance) {
+      MeshLib::_instance->_lockState();
+      MeshLib::_instance->_reboot_pending = true;
+      MeshLib::_instance->_unlockState();
+    }
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+#if MESH_LIB_LOG_ENABLED
+    MESH_LOG("\n❌ OTA error: %u\n", (unsigned int)error);
+#endif
+    if (MeshLib::_instance) MeshLib::_instance->_exitOTAMode();
+  });
+  ArduinoOTA.begin();
+
+  _ota_mode = true;
+  _ota_start_time = millis();
+
+#if MESH_LIB_LOG_ENABLED
+  MESH_LOG("✅ OTA ready at %s\n", WiFi.localIP().toString().c_str());
+#endif
+}
+
+void MeshLib::_handleOTA() {
+  if (!_ota_mode) return;
+
+  ArduinoOTA.handle();
+
+  if (millis() - _ota_start_time > OTA_TIMEOUT_MS) {
+#if MESH_LIB_LOG_ENABLED
+    MESH_LOG("⏰ OTA timeout, restarting...\n");
+#endif
+    _exitOTAMode();
+  }
+}
+
+void MeshLib::_exitOTAMode() {
+  _ota_mode = false;
+  _ota_pending = false;
+
+#if MESH_LIB_LOG_ENABLED
+  MESH_LOG("↩️ Exiting OTA mode, rebooting to restore mesh...\n");
+#endif
+
+  delay(200);
+  ESP.restart();
+}
 void MeshLib::_handleRebootRequest(const standard_mesh_message &msg) {
   char target_mac[18];
   if (_parseTargetMac(msg.payload, target_mac, sizeof(target_mac)) && _isForUs(target_mac)) {
 #if MESH_LIB_LOG_ENABLED
     MESH_LOG("🔄 Reboot command received for us\n");
 #endif
+    _lockState();
     _reboot_pending = true;
+    _unlockState();
   }
 }
 
@@ -358,7 +564,7 @@ bool MeshLib::_parseTargetMac(const char *payload, char *out_mac, size_t mac_siz
 bool MeshLib::_isForUs(const char *target_mac) const {
   if (!target_mac || target_mac[0] == '\0') return false;
   String our_mac = WiFi.macAddress();
-  return _equals(target_mac, our_mac.c_str());
+  return equalsIgnoreCase(target_mac, our_mac.c_str());
 }
 
 // ================== DEDUP PO MID ==================
@@ -382,17 +588,34 @@ bool MeshLib::_seenAndRemember(const standard_mesh_message &m) {
 
 bool MeshLib::loop() {
   // Execute pending reboot outside of ESP-NOW callback context
+  bool do_reboot = false;
+  _lockState();
   if (_reboot_pending) {
     _reboot_pending = false;
+    do_reboot = true;
+  }
+  _unlockState();
+  if (do_reboot) {
     _doReboot();
     return true;
   }
 
   // Pick up pending OTA request outside of ESP-NOW callback context
-  if (!_ota_mode && _ota_pending) {
-    ota_request req = _ota_req; // make a local copy
-    _ota_pending = false;
-    _enterOTAMode(req.ssid, req.passwd, req.ip);
+  if (!_ota_mode) {
+    ota_request req{};
+    bool has_pending_ota = false;
+
+    _lockState();
+    if (_ota_pending) {
+      req = _ota_req; // make a local copy
+      _ota_pending = false;
+      has_pending_ota = true;
+    }
+    _unlockState();
+
+    if (has_pending_ota) {
+      _enterOTAMode(req.ssid, req.passwd, req.ip);
+    }
   }
 
   // When OTA mode is active, prioritize OTA handling and signal caller
@@ -402,3 +625,6 @@ bool MeshLib::loop() {
   }
   return false;
 }
+
+
+

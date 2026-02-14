@@ -18,9 +18,10 @@ void setup() {
 
   // Optionally send a message on same topic to see it locally and across the mesh
   delay(1000);
-  mesh.sendMessage("/example/topic", "hello from subscriber", 3);
+  mesh.sendMessage("example/topic", "hello from subscriber", 3);
 }
 
 void loop() {
   (void)mesh.loop();
 }
+

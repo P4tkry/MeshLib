@@ -37,7 +37,7 @@ struct standard_mesh_message {
 ---
 ## Publiczne API (szczegóły)
 - `MeshLib(ReceiveCallback cb)` — `cb` ma sygnaturę `void cb(const standard_mesh_message&)`.
-- `initMesh(name, subscribed, topics_count, wifi_channel)` — `subscribed=nullptr` i `topics_count=0` oznacza brak filtra (odbieraj wszystko). `wifi_channel=0` ustawia kanał 1.
+- `initMesh(name, subscribed, topics_count, wifi_channel, power_save=false)` — `subscribed=nullptr` i `topics_count=0` oznacza brak filtra (odbieraj wszystko). `wifi_channel=0` ustawia kanał 1.
 - `sendMessage(topic, payload, ttl)` — typ `data`; jeśli `ttl<=0`, używa `MESH_DEFAULT_TTL` (4).
 - `sendCmd(topic, payload, ttl)` — typ `cmd`; analogiczny TTL.
 - `sendDiscover(ttl)` — wysyła `discover/get`; payload pusty.
@@ -62,7 +62,7 @@ struct standard_mesh_message {
 ## OTA — przebieg krok po kroku
 1) Pakiet `ota/start` trafia do celu, parsuje payload i zapisuje żądanie jako `pending` (poza callbackiem ESP-NOW).
 2) W `mesh.loop()` wykonywany jest `_enterOTAMode`: `esp_now_deinit`, wyłączenie power-save, tryb STA, opcjonalny static IP, `WiFi.begin()`.
-3) Próba Wi-Fi trwa ~3.6 s (50 prób po 300 ms). Niepowodzenie → restart i powrót do mesh.
+3) Próba Wi-Fi trwa ~15 s (50 prób po 300 ms). Niepowodzenie → restart i powrót do mesh.
 4) Po połączeniu startuje ArduinoOTA: timeout 5 min na upload, logi przez `Serial`.
 5) Po sukcesie OTA następuje restart. Po timeout lub błędzie `_exitOTAMode()` również restartuje, aby wrócić do mesh.
 
@@ -110,3 +110,4 @@ void loop() {
 ---
 ## Licencja
 MIT
+
