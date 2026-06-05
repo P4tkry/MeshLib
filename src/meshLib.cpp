@@ -155,6 +155,11 @@ bool MeshLib::_sendMessage(const standard_mesh_message &message) {
   _fillMid(m);    // NOWE: nadaj MID, jeżeli brak
   (void)_seenAndRemember(m); // zapisz własny MID, by nie forwardować po zawróceniu
 
+#if MESH_LIB_LOG_ENABLED
+  MESH_LOG("📤 tx self: mid=%lu type=%s topic=%s ttl=%d payload=%s\n",
+           (unsigned long)m.mid, m.type, m.topic, m.ttl, m.payload);
+#endif
+
 #if defined(ARDUINO_ARCH_ESP32)
   esp_err_t r = esp_now_send(BROADCAST_ADDR,
                              reinterpret_cast<const uint8_t*>(&m),
@@ -220,6 +225,11 @@ void MeshLib::_handleReceive(const uint8_t *mac, const uint8_t *data, int len) {
 
   standard_mesh_message msg{};
   memcpy(&msg, data, sizeof(msg));
+
+#if MESH_LIB_LOG_ENABLED
+  MESH_LOG("📥 rx raw: mid=%lu type=%s topic=%s sender=%s ttl=%d payload=%s\n",
+           (unsigned long)msg.mid, msg.type, msg.topic, msg.sender, msg.ttl, msg.payload);
+#endif
 
   // self MAC check (binarne)
   uint8_t my[6];
@@ -310,6 +320,9 @@ void MeshLib::_autoHandleCmd(standard_mesh_message &msg) {
 #else
     const uint32_t jitter_ms = 20 + (random() % 231);
 #endif
+#if MESH_LIB_LOG_ENABLED
+    MESH_LOG("🕒 discover scheduled in %lu ms\n", (unsigned long)jitter_ms);
+#endif
     _lockState();
     _discover_due_at = millis() + jitter_ms;
     _discover_pending = true;
@@ -340,6 +353,9 @@ void MeshLib::_sendDiscoverPost() {
            _name ? _name : "node", mac.c_str(), chip, _channel);
 
   // MID zostanie nadany w sendMessage()
+#if MESH_LIB_LOG_ENABLED
+  MESH_LOG("📡 discover/post prepared: %s\n", resp.payload);
+#endif
   (void)_sendMessage(resp);
 }
 
@@ -611,20 +627,34 @@ bool MeshLib::_enqueueRx(const standard_mesh_message &msg) {
     queued = true;
   }
   _unlockState();
+#if MESH_LIB_LOG_ENABLED
+  if (queued) {
+    MESH_LOG("📬 rx queued: mid=%lu topic=%s count=%u\n",
+             (unsigned long)msg.mid, msg.topic, (unsigned)_rx_queue_count);
+  }
+#endif
   return queued;
 }
 
 bool MeshLib::_dequeueRx(standard_mesh_message &msg) {
   bool has_msg = false;
+  uint8_t remaining = 0;
   _lockState();
   if (_rx_queue_count > 0 && _rx_queue[_rx_queue_head].used) {
     msg = _rx_queue[_rx_queue_head].msg;
     _rx_queue[_rx_queue_head].used = false;
     _rx_queue_head = (_rx_queue_head + 1) % MESH_RX_QUEUE_MAX;
     _rx_queue_count--;
+    remaining = _rx_queue_count;
     has_msg = true;
   }
   _unlockState();
+#if MESH_LIB_LOG_ENABLED
+  if (has_msg) {
+    MESH_LOG("📭 rx dequeue: mid=%lu topic=%s remaining=%u\n",
+             (unsigned long)msg.mid, msg.topic, (unsigned)remaining);
+  }
+#endif
   return has_msg;
 }
 
