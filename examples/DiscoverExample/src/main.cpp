@@ -23,6 +23,6 @@ void setup() {
 }
 
 void loop() {
-  // Handle any internal work (not required for discover, but good practice)
+  // mesh.loop() now also dispatches received messages to the user callback.
   (void)mesh.loop();
 }

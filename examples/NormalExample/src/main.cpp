@@ -15,6 +15,7 @@ void setup() {
 }
 
 void loop() {
+  // mesh.loop() dispatches queued RX callbacks and handles OTA/reboot.
   if (mesh.loop()) return; // pause user logic when OTA/reboot active
 
   static unsigned long last = 0;

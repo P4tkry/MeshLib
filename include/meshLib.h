@@ -18,6 +18,10 @@
 #define DEDUP_MAX               100
 #endif
 
+#ifndef MESH_RX_QUEUE_MAX
+#define MESH_RX_QUEUE_MAX       8
+#endif
+
 #ifndef MESH_LIB_LOG_ENABLED
 #define MESH_LIB_LOG_ENABLED    1
 #endif
@@ -106,6 +110,16 @@ private:
 
   ReceiveCallback _callback = nullptr;
 
+  struct RxQueueEntry {
+    standard_mesh_message msg{};
+    bool used = false;
+  };
+
+  RxQueueEntry _rx_queue[MESH_RX_QUEUE_MAX]{};
+  uint8_t _rx_queue_head = 0;
+  uint8_t _rx_queue_tail = 0;
+  uint8_t _rx_queue_count = 0;
+
   // ---- DEDUP po MID ----
   struct DedupEntry {
     uint32_t mid;  // zapamiętany MID; 0 oznacza pusty slot
@@ -157,6 +171,8 @@ private:
   void _handleOTA(); // call periodically when in OTA mode
   void _exitOTAMode(); // powrót do mesh'u
   void _doReboot();
+  bool _enqueueRx(const standard_mesh_message &msg);
+  bool _dequeueRx(standard_mesh_message &msg);
 
   bool _sendMessage(const standard_mesh_message &message);
 

@@ -33,6 +33,7 @@ void setup() {
 }
 
 void loop() {
+  // mesh.loop() dispatches queued RX callbacks and runs OTA state.
   if (mesh.loop()) return; // OTA in progress
   delay(10);
 }

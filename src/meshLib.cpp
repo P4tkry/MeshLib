@@ -250,7 +250,12 @@ void MeshLib::_handleReceive(const uint8_t *mac, const uint8_t *data, int len) {
     if (_equals(_subscribed_topics[i], msg.topic)) subscribed = true;
   }
   if (subscribed && _callback) {
-    _callback(msg);
+    if (!_enqueueRx(msg)) {
+#if MESH_LIB_LOG_ENABLED
+      MESH_LOG("⚠️ rx queue full, dropping mid=%lu topic=%s\n",
+               (unsigned long)msg.mid, msg.topic);
+#endif
+    }
   }
 
   // forward z TTL + krótki backoff
@@ -595,7 +600,40 @@ bool MeshLib::_seenAndRemember(const standard_mesh_message &m) {
   return false;
 }
 
+bool MeshLib::_enqueueRx(const standard_mesh_message &msg) {
+  bool queued = false;
+  _lockState();
+  if (_rx_queue_count < MESH_RX_QUEUE_MAX) {
+    _rx_queue[_rx_queue_tail].msg = msg;
+    _rx_queue[_rx_queue_tail].used = true;
+    _rx_queue_tail = (_rx_queue_tail + 1) % MESH_RX_QUEUE_MAX;
+    _rx_queue_count++;
+    queued = true;
+  }
+  _unlockState();
+  return queued;
+}
+
+bool MeshLib::_dequeueRx(standard_mesh_message &msg) {
+  bool has_msg = false;
+  _lockState();
+  if (_rx_queue_count > 0 && _rx_queue[_rx_queue_head].used) {
+    msg = _rx_queue[_rx_queue_head].msg;
+    _rx_queue[_rx_queue_head].used = false;
+    _rx_queue_head = (_rx_queue_head + 1) % MESH_RX_QUEUE_MAX;
+    _rx_queue_count--;
+    has_msg = true;
+  }
+  _unlockState();
+  return has_msg;
+}
+
 bool MeshLib::loop() {
+  standard_mesh_message queued_msg{};
+  if (_callback && _dequeueRx(queued_msg)) {
+    _callback(queued_msg);
+  }
+
   bool do_discover_post = false;
 
   _lockState();

@@ -2,7 +2,7 @@
 #include <meshLib.h>
 
 void onMeshReceive(const standard_mesh_message &msg) {
-  // This callback will be invoked only for subscribed topics
+  // This callback is delivered from mesh.loop() only for subscribed topics.
   Serial.printf("[SUB RX] %s %s %s %s\n", msg.type, msg.topic, msg.sender, msg.payload);
 }
 
@@ -22,6 +22,7 @@ void setup() {
 }
 
 void loop() {
+  // Keep calling mesh.loop() frequently so queued RX messages reach the callback.
   (void)mesh.loop();
 }
 

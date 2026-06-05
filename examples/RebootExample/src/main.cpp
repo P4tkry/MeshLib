@@ -23,6 +23,6 @@ void setup() {
 }
 
 void loop() {
-  // loop handles pending reboot if this node is the target
+  // mesh.loop() dispatches queued RX callbacks and handles pending reboot.
   (void)mesh.loop();
 }
