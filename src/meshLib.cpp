@@ -299,7 +299,16 @@ void MeshLib::_handleReceive(const uint8_t *mac, const uint8_t *data, int len) {
 
 void MeshLib::_autoHandleCmd(standard_mesh_message &msg) {
   if (_equals(msg.topic, MESH_TOPIC_DISCOVER_GET)) {
-    _sendDiscoverPost();
+    // Schedule discover/post outside the ESP-NOW callback with jitter to reduce collisions.
+#if defined(ARDUINO_ARCH_ESP32)
+    const uint32_t jitter_ms = 20 + (esp_random() % 231);
+#else
+    const uint32_t jitter_ms = 20 + (random() % 231);
+#endif
+    _lockState();
+    _discover_due_at = millis() + jitter_ms;
+    _discover_pending = true;
+    _unlockState();
   } else if (_equals(msg.topic, MESH_TOPIC_OTA_START)) {
     _handleOTARequest(msg);
   } else if (_equals(msg.topic, MESH_TOPIC_REBOOT)) {
@@ -587,6 +596,18 @@ bool MeshLib::_seenAndRemember(const standard_mesh_message &m) {
 }
 
 bool MeshLib::loop() {
+  bool do_discover_post = false;
+
+  _lockState();
+  if (_discover_pending && long(millis() - _discover_due_at) >= 0) {
+    _discover_pending = false;
+    do_discover_post = true;
+  }
+  _unlockState();
+  if (do_discover_post) {
+    _sendDiscoverPost();
+  }
+
   // Execute pending reboot outside of ESP-NOW callback context
   bool do_reboot = false;
   _lockState();

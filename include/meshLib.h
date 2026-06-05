@@ -119,6 +119,10 @@ private:
   unsigned long _ota_start_time = 0;
   const unsigned long OTA_TIMEOUT_MS = 300000; // 5 minut
 
+  // Defer discover responses out of the ESP-NOW callback and spread them in time.
+  volatile bool _discover_pending = false;
+  unsigned long _discover_due_at = 0;
+
   // Defer switching from ESP-NOW callback to main loop
   volatile bool _ota_pending = false;
   ota_request _ota_req{};
