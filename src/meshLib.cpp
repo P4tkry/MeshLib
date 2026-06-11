@@ -40,11 +40,14 @@ uint32_t MeshLib::rand32() {
 MeshLib::MeshLib(ReceiveCallback cb)
 : _callback(cb)
 {
-  _instance   = this;
   _topics_count = 0;
   _channel      = 1;
   _dedup_idx    = 0;
   // _dedup jest wyzerowany przez in-class init / statyczną inicjalizację
+}
+
+MeshLib::~MeshLib() {
+  deinitMesh();
 }
 
 void MeshLib::_lockState() {
@@ -65,19 +68,70 @@ void MeshLib::_unlockState() {
 
 // ================== INIT MESH ==================
 
-void MeshLib::initMesh(const char *name,
-                       const char *subscribed[],
+bool MeshLib::initMesh(const char *name,
+                       const char *const subscribed[],
                        int topics_count,
                        uint8_t wifi_channel,
                        bool power_save)
 {
-  _name              = name;
-  _subscribed_topics = subscribed;
-  _topics_count      = topics_count;
-  _channel           = wifi_channel ? wifi_channel : 1;
+  const bool requested_filter = (subscribed != nullptr && topics_count > 0);
+
+  if (_instance != nullptr && _instance != this) {
+#if MESH_LIB_LOG_ENABLED
+    MESH_LOG("⚠️ initMesh ignored because another MeshLib instance is active\n");
+#endif
+    return false;
+  }
+  if (_instance == this) {
+#if MESH_LIB_LOG_ENABLED
+    MESH_LOG("⚠️ initMesh ignored because this MeshLib instance is already active; call deinitMesh() first\n");
+#endif
+    return false;
+  }
+
+  if (topics_count < 0) {
+    topics_count = 0;
+  }
+  if (topics_count > MESH_MAX_SUBSCRIBED_TOPICS) {
+#if MESH_LIB_LOG_ENABLED
+    MESH_LOG("⚠️ topic list truncated to %d entries\n", MESH_MAX_SUBSCRIBED_TOPICS);
+#endif
+    topics_count = MESH_MAX_SUBSCRIBED_TOPICS;
+  }
+
+  int accepted_topics = 0;
+  char validated_topics[MESH_MAX_SUBSCRIBED_TOPICS][MESH_MAX_SUBSCRIBED_TOPIC_LEN]{};
+  const uint8_t channel = wifi_channel ? wifi_channel : 1;
+
+  if (subscribed && topics_count > 0) {
+    for (int i = 0; i < topics_count; ++i) {
+      const char *topic = subscribed[i];
+      if (!topic) {
+        continue;
+      }
+
+      const size_t len = strlen(topic);
+      if (len >= MESH_MAX_SUBSCRIBED_TOPIC_LEN) {
+#if MESH_LIB_LOG_ENABLED
+        MESH_LOG("⚠️ skipped overlong topic: %s\n", topic);
+#endif
+        continue;
+      }
+
+      strncpy(validated_topics[accepted_topics], topic, MESH_MAX_SUBSCRIBED_TOPIC_LEN - 1);
+      validated_topics[accepted_topics][MESH_MAX_SUBSCRIBED_TOPIC_LEN - 1] = '\0';
+      ++accepted_topics;
+    }
+  }
+
+  if (requested_filter && accepted_topics == 0) {
+#if MESH_LIB_LOG_ENABLED
+    MESH_LOG("⚠️ initMesh failed: no valid subscribed topics after validation\n");
+#endif
+    return false;
+  }
 
 #if defined(ARDUINO_ARCH_ESP32)
-
   WiFi.mode(WIFI_STA);
   if (power_save) {
     esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
@@ -86,24 +140,24 @@ void MeshLib::initMesh(const char *name,
   }
   esp_wifi_set_max_tx_power(78); // ~19.5 dBm
   esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_LR);
-  esp_wifi_set_channel(_channel, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
 
   if (esp_now_init() != ESP_OK) {
     MESH_LOG("❌ ESP-NOW init failed (ESP32)\n");
-    while (true) delay(1000);
+    return false;
   }
-  esp_now_register_recv_cb(&_recvThunk);
 
   esp_now_peer_info_t peer{};
   memcpy(peer.peer_addr, BROADCAST_ADDR, 6);
-  peer.channel = _channel;
+  peer.channel = channel;
   peer.encrypt = false;
   if (esp_now_add_peer(&peer) != ESP_OK) {
     MESH_LOG("❌ esp_now_add_peer failed (ESP32)\n");
+    esp_now_deinit();
+    return false;
   }
 
 #elif defined(ARDUINO_ARCH_ESP8266)
-
   WiFi.mode(WIFI_STA);
   if (power_save) {
     WiFi.setSleepMode(WIFI_MODEM_SLEEP);
@@ -111,20 +165,43 @@ void MeshLib::initMesh(const char *name,
     WiFi.setSleepMode(WIFI_NONE_SLEEP);
   }
   WiFi.setOutputPower(20.5f);
-  wifi_set_channel(_channel);
+  wifi_set_channel(channel);
 
   if (esp_now_init() != 0) {
     MESH_LOG("❌ ESP-NOW init failed (ESP8266)\n");
-    while (true) delay(1000);
+    return false;
   }
   esp_now_set_self_role(ESP_NOW_ROLE_COMBO);
-  esp_now_register_recv_cb(&_recvThunk);
 
-  if (esp_now_add_peer((uint8_t*)BROADCAST_ADDR, ESP_NOW_ROLE_COMBO, _channel, NULL, 0) != 0) {
+  if (esp_now_add_peer((uint8_t*)BROADCAST_ADDR, ESP_NOW_ROLE_COMBO, channel, NULL, 0) != 0) {
     MESH_LOG("❌ esp_now_add_peer failed (ESP8266)\n");
+    esp_now_deinit();
+    return false;
   }
 
 #endif
+
+  _instance = this;
+  _clearSubscribedTopics();
+  _name         = name;
+  _topics_count = accepted_topics;
+  _channel      = channel;
+  for (int i = 0; i < accepted_topics; ++i) {
+    strncpy(_subscribed_topics[i], validated_topics[i], MESH_MAX_SUBSCRIBED_TOPIC_LEN - 1);
+    _subscribed_topics[i][MESH_MAX_SUBSCRIBED_TOPIC_LEN - 1] = '\0';
+  }
+
+  _dedup_idx = 0;
+  memset(_dedup, 0, sizeof(_dedup));
+  _forward_head = 0;
+  _forward_tail = 0;
+  _forward_count = 0;
+  _ota_mode = false;
+  _ota_start_time = 0;
+  _ota_pending = false;
+  _reboot_pending = false;
+
+  esp_now_register_recv_cb(&_recvThunk);
 
   uint8_t mac_bin[6];
 #if defined(ARDUINO_ARCH_ESP32)
@@ -143,6 +220,37 @@ void MeshLib::initMesh(const char *name,
 
   MESH_LOG("✅ MeshLib: %s ready (ch=%u, MAC=%s)\n",
            _name ? _name : "node", _channel, WiFi.macAddress().c_str());
+
+  return true;
+}
+
+bool MeshLib::deinitMesh() {
+  _deinitHardware();
+  if (_instance == this) {
+    _instance = nullptr;
+  }
+  _clearSubscribedTopics();
+  _name = nullptr;
+  _channel = 1;
+  _topics_count = 0;
+  _dedup_idx = 0;
+  memset(_dedup, 0, sizeof(_dedup));
+  _forward_head = 0;
+  _forward_tail = 0;
+  _forward_count = 0;
+  _ota_mode = false;
+  _ota_start_time = 0;
+  _ota_pending = false;
+  _reboot_pending = false;
+  return true;
+}
+
+void MeshLib::_deinitHardware() {
+#if defined(ARDUINO_ARCH_ESP32)
+  esp_now_deinit();
+#elif defined(ARDUINO_ARCH_ESP8266)
+  esp_now_deinit();
+#endif
 }
 
 // ================== WYSYŁANIE ==================
@@ -283,29 +391,12 @@ void MeshLib::_handleReceive(const uint8_t *mac, const uint8_t *data, int len) {
           return;
         }
       }
+      if (!_queueForward(msg)) {
 #if MESH_LIB_LOG_ENABLED
-      MESH_LOG("↪️ forward: mid=%lu type=%s topic=%s ttl=%d\n",
-               (unsigned long)msg.mid, msg.type, msg.topic, msg.ttl);
+        MESH_LOG("⚠️ forward queue full: mid=%lu type=%s topic=%s\n",
+                 (unsigned long)msg.mid, msg.type, msg.topic);
 #endif
-#if defined(ARDUINO_ARCH_ESP32)
-      uint32_t us = 1000 + (esp_random() % 3000);
-#else
-      uint32_t us = 1000 + (random() % 3000);
-#endif
-      delayMicroseconds(us);
-#if defined(ARDUINO_ARCH_ESP32)
-      esp_err_t r = esp_now_send(BROADCAST_ADDR, (uint8_t*)&msg, sizeof(msg));
-      if (r != ESP_OK) {
-        MESH_LOG("⚠️ forward send failed: mid=%lu err=%d\n", (unsigned long)msg.mid, r);
       }
-#else
-      int r = esp_now_send((uint8_t*)BROADCAST_ADDR,
-                           (uint8_t*)&msg,
-                           (uint8_t)sizeof(msg));
-      if (r != 0) {
-        MESH_LOG("⚠️ forward send failed: mid=%lu err=%d\n", (unsigned long)msg.mid, r);
-      }
-#endif
     }
   }
 }
@@ -546,6 +637,70 @@ void MeshLib::_doReboot() {
   ESP.restart();
 }
 
+void MeshLib::_clearSubscribedTopics() {
+  for (int i = 0; i < MESH_MAX_SUBSCRIBED_TOPICS; ++i) {
+    _subscribed_topics[i][0] = '\0';
+  }
+  _topics_count = 0;
+}
+
+bool MeshLib::_queueForward(const standard_mesh_message &msg) {
+  bool queued = false;
+  _lockState();
+  if (_forward_count == FORWARD_QUEUE_SIZE) {
+    _forward_head = (uint8_t)((_forward_head + 1) % FORWARD_QUEUE_SIZE);
+    --_forward_count;
+  }
+  _forward_queue[_forward_tail] = msg;
+  _forward_tail = (uint8_t)((_forward_tail + 1) % FORWARD_QUEUE_SIZE);
+  ++_forward_count;
+  queued = true;
+  _unlockState();
+  return queued;
+}
+
+void MeshLib::_processForwardQueue() {
+  while (true) {
+    standard_mesh_message msg{};
+    bool has_msg = false;
+
+    _lockState();
+    if (_forward_count > 0) {
+      msg = _forward_queue[_forward_head];
+      _forward_head = (uint8_t)((_forward_head + 1) % FORWARD_QUEUE_SIZE);
+      --_forward_count;
+      has_msg = true;
+    }
+    _unlockState();
+
+    if (!has_msg) break;
+
+#if MESH_LIB_LOG_ENABLED
+    MESH_LOG("↪️ forward: mid=%lu type=%s topic=%s ttl=%d\n",
+             (unsigned long)msg.mid, msg.type, msg.topic, msg.ttl);
+#endif
+#if defined(ARDUINO_ARCH_ESP32)
+    uint32_t us = 1000 + (esp_random() % 3000);
+#else
+    uint32_t us = 1000 + (random() % 3000);
+#endif
+    delayMicroseconds(us);
+#if defined(ARDUINO_ARCH_ESP32)
+    esp_err_t r = esp_now_send(BROADCAST_ADDR, (uint8_t*)&msg, sizeof(msg));
+    if (r != ESP_OK) {
+      MESH_LOG("⚠️ forward send failed: mid=%lu err=%d\n", (unsigned long)msg.mid, r);
+    }
+#else
+    int r = esp_now_send((uint8_t*)BROADCAST_ADDR,
+                         (uint8_t*)&msg,
+                         (uint8_t)sizeof(msg));
+    if (r != 0) {
+      MESH_LOG("⚠️ forward send failed: mid=%lu err=%d\n", (unsigned long)msg.mid, r);
+    }
+#endif
+  }
+}
+
 // ================== POMOCNICZE ==================
 
 void MeshLib::_fillSender(standard_mesh_message &msg) const {
@@ -604,16 +759,22 @@ bool MeshLib::_seenAndRemember(const standard_mesh_message &m) {
 
   if (mid == 0) return false; // brak MID -> nie deduplikujemy
 
+  bool seen = false;
+  _lockState();
   for (int i = 0; i < DEDUP_MAX; ++i) {
     if (_dedup[i].mid == mid) {
-      return true; // widziany wcześniej
+      seen = true; // widziany wcześniej
+      break;
     }
   }
 
-  // nowy MID – zapisz w buforze cyklicznym
-  _dedup[_dedup_idx].mid = mid;
-  _dedup_idx = (_dedup_idx + 1) % DEDUP_MAX;
-  return false;
+  if (!seen) {
+    // nowy MID – zapisz w buforze cyklicznym
+    _dedup[_dedup_idx].mid = mid;
+    _dedup_idx = (_dedup_idx + 1) % DEDUP_MAX;
+  }
+  _unlockState();
+  return seen;
 }
 
 bool MeshLib::_enqueueRx(const standard_mesh_message &msg) {
@@ -687,6 +848,11 @@ bool MeshLib::loop() {
   if (do_reboot) {
     _doReboot();
     return true;
+  }
+
+  // Forward queued packets outside of ESP-NOW callback context
+  if (!_ota_mode) {
+    _processForwardQueue();
   }
 
   // Pick up pending OTA request outside of ESP-NOW callback context

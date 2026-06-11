@@ -36,12 +36,51 @@ struct standard_mesh_message {
 
 ---
 ## Publiczne API (szczegóły)
-- `MeshLib(ReceiveCallback cb)` — `cb` ma sygnaturę `void cb(const standard_mesh_message&)`.
-- `initMesh(name, subscribed, topics_count, wifi_channel, power_save=false)` — `subscribed=nullptr` i `topics_count=0` oznacza brak filtra (odbieraj wszystko). `wifi_channel=0` ustawia kanał 1.
+- `MeshLib(ReceiveCallback cb)` — `cb` ma sygnaturę `void cb(const standard_mesh_message&)`; biblioteka wspiera jedną aktywną instancję na proces.
+- `initMesh(name, subscribed, topics_count, wifi_channel, power_save=false)` — zwraca `bool`; `subscribed=nullptr` i `topics_count=0` oznacza brak filtra (odbieraj wszystko). `wifi_channel=0` ustawia kanał 1.
+- `initMesh()` is transactional: if validation or hardware init fails, the instance is not activated and the previous state is left unchanged.
+- To reconfigure the same object, call `deinitMesh()` first and then `initMesh()` with the new settings.
+- Filtr topiców jest kopiowany do wewnętrznego, stałego bufora: maks. `MESH_MAX_SUBSCRIBED_TOPICS` topiców, każdy do `MESH_MAX_SUBSCRIBED_TOPIC_LEN - 1` znaków.
 - `sendMessage(topic, payload, ttl)` — typ `data`; jeśli `ttl<=0`, używa `MESH_DEFAULT_TTL` (4).
 - `sendCmd(topic, payload, ttl)` — typ `cmd`; analogiczny TTL.
 - `sendDiscover(ttl)` — wysyła `discover/get`; payload pusty.
-- `loop()` — wywołuj często; przetwarza pending OTA/reboot. Zwraca `true`, gdy biblioteka jest zajęta (OTA lub właśnie wykonuje reboot).
+- `deinitMesh()` — zwalnia backend ESP-NOW i czyści stan runtime; przydaje się przed ponowną konfiguracją tego samego obiektu.
+- `loop()` — wywołuj często; przetwarza pending OTA/reboot i kolejkę forwardingu. Zwraca `true`, gdy biblioteka jest zajęta (OTA lub właśnie wykonuje reboot).
+
+### Runtime contract
+- The subscription list passed to `initMesh()` is copied internally, so the caller may use stack-allocated arrays.
+- The subscription filter uses a fixed internal buffer, so no heap allocation is required for topic storage.
+- Only one `MeshLib` instance should be active at a time.
+- The object is non-copyable and non-movable.
+- `loop()` is part of the runtime contract and must be called regularly for forwarding, OTA, and reboot handling to work correctly.
+- `deinitMesh()` can be used to explicitly release ESP-NOW before reconfiguration.
+- The wire protocol is unchanged by these internal fixes.
+
+### Recommended limits
+- `MESH_MAX_SUBSCRIBED_TOPICS = 8`
+- `MESH_MAX_SUBSCRIBED_TOPIC_LEN = 64`
+- `MESH_FORWARD_QUEUE_SIZE = 12`
+- If you need more topics or longer topic names, raise these macros in your build settings before including the header.
+- Forward queue uses `drop oldest` when full, so newer packets are preferred under burst load.
+- When `initMesh()` receives a fixed-size array of topics, the library enforces `MESH_MAX_SUBSCRIBED_TOPICS` at compile time via `static_assert`.
+- The `topics_count` overload stays available for dynamic/runtime topic lists, so compile-time validation applies only to fixed arrays.
+- An intentionally empty filter is valid only when no topic list is provided at all (`subscribed=nullptr`, `topics_count=0`); if a filter was provided but every topic was rejected by validation, `initMesh()` returns `false`.
+
+
+## Tryb Oszczędzania Energii (`power_save`)
+- Parametr `power_save` w `initMesh(...)` pozwala obniżyć pobór energii kosztem responsywności i odporności na straty pakietów.
+- `power_save=false` (domyślnie):
+  - ESP32: `WIFI_PS_NONE`
+  - ESP8266: `WIFI_NONE_SLEEP`
+  - Najlepsza responsywność i stabilność mesh.
+- `power_save=true`:
+  - ESP32: `WIFI_PS_MIN_MODEM`
+  - ESP8266: `WIFI_MODEM_SLEEP`
+  - Niższy pobór energii, ale większe opóźnienia i potencjalnie więcej zgubionych ramek przy dużym ruchu.
+- Rekomendacja:
+  - Węzły bateryjne: rozważ `power_save=true`.
+  - Węzły routujące / urządzenia od OTA: preferuj `power_save=false`.
+- Podczas OTA biblioteka i tak wyłącza power-save, żeby zwiększyć stabilność transferu.
 
 ---
 ## Forwarding i deduplikacja

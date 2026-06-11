@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Arduino.h>
+#include <stddef.h>
 
 #if defined(ARDUINO_ARCH_ESP32)
   #include <WiFi.h>
@@ -20,6 +21,18 @@
 
 #ifndef MESH_RX_QUEUE_MAX
 #define MESH_RX_QUEUE_MAX       8
+#endif
+
+#ifndef MESH_MAX_SUBSCRIBED_TOPICS
+#define MESH_MAX_SUBSCRIBED_TOPICS  8
+#endif
+
+#ifndef MESH_MAX_SUBSCRIBED_TOPIC_LEN
+#define MESH_MAX_SUBSCRIBED_TOPIC_LEN 64
+#endif
+
+#ifndef MESH_FORWARD_QUEUE_SIZE
+#define MESH_FORWARD_QUEUE_SIZE 12
 #endif
 
 #ifndef MESH_LIB_LOG_ENABLED
@@ -82,16 +95,32 @@ class MeshLib {
 public:
   using ReceiveCallback = void(*)(const standard_mesh_message&);
   explicit MeshLib(ReceiveCallback cb);
+  ~MeshLib();
+  MeshLib(const MeshLib&) = delete;
+  MeshLib& operator=(const MeshLib&) = delete;
+  MeshLib(MeshLib&&) = delete;
+  MeshLib& operator=(MeshLib&&) = delete;
 
-  void initMesh(const char *name,
-                const char *subscribed[],
+  bool initMesh(const char *name,
+                const char *const subscribed[],
                 int topics_count,
                 uint8_t wifi_channel,
                 bool power_save = false);
 
+  template <size_t N>
+  bool initMesh(const char *name,
+                const char *const (&subscribed)[N],
+                uint8_t wifi_channel,
+                bool power_save = false)
+  {
+    static_assert(N <= MESH_MAX_SUBSCRIBED_TOPICS, "Too many subscribed topics");
+    return initMesh(name, subscribed, static_cast<int>(N), wifi_channel, power_save);
+  }
+
   bool sendMessage(const char *topic, const char *payload, int ttl = -1);
   bool sendCmd(const char *topic, const char *payload, int ttl = -1);
   bool sendDiscover(int ttl);
+  bool deinitMesh();
   
   // OTA support (managed internally)
   bool loop();      // tick function; handles OTA when active
@@ -104,7 +133,7 @@ private:
   static uint32_t rand32();
 
   const char *_name = nullptr;
-  const char **_subscribed_topics = nullptr;
+  char _subscribed_topics[MESH_MAX_SUBSCRIBED_TOPICS][MESH_MAX_SUBSCRIBED_TOPIC_LEN]{};
   int _topics_count = 0;
   uint8_t _channel = 1;
 
@@ -127,6 +156,12 @@ private:
 
   DedupEntry _dedup[DEDUP_MAX]{};
   int _dedup_idx = 0;
+
+  enum { FORWARD_QUEUE_SIZE = MESH_FORWARD_QUEUE_SIZE };
+  standard_mesh_message _forward_queue[FORWARD_QUEUE_SIZE]{};
+  uint8_t _forward_head = 0;
+  uint8_t _forward_tail = 0;
+  uint8_t _forward_count = 0;
 
   // OTA state
   bool _ota_mode = false;
@@ -173,6 +208,10 @@ private:
   void _doReboot();
   bool _enqueueRx(const standard_mesh_message &msg);
   bool _dequeueRx(standard_mesh_message &msg);
+  void _deinitHardware();
+  void _clearSubscribedTopics();
+  bool _queueForward(const standard_mesh_message &msg);
+  void _processForwardQueue();
 
   bool _sendMessage(const standard_mesh_message &message);
 
