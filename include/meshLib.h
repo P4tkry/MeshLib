@@ -113,8 +113,12 @@ public:
                 uint8_t wifi_channel,
                 bool power_save = false)
   {
-    static_assert(N <= MESH_MAX_SUBSCRIBED_TOPICS, "Too many subscribed topics");
-    return initMesh(name, subscribed, static_cast<int>(N), wifi_channel, power_save);
+    if constexpr (N == 0) {
+      return initMesh(name, nullptr, 0, wifi_channel, power_save);
+    } else {
+      static_assert(N <= MESH_MAX_SUBSCRIBED_TOPICS, "Too many subscribed topics");
+      return initMesh(name, subscribed, static_cast<int>(N), wifi_channel, power_save);
+    }
   }
 
   bool sendMessage(const char *topic, const char *payload, int ttl = -1);
